@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: temporal-autoscaler-operator
+  namespace: temporal-autoscaler-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: temporal-autoscaler-operator
+rules:
+  # TemporalScaler CRD permissions
+  - apiGroups:
+      - scaling.example.com
+    resources:
+      - temporalscalers
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - scaling.example.com
+    resources:
+      - temporalscalers/status
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
+      - scaling.example.com
+    resources:
+      - temporalscalers/finalizers
+    verbs:
+      - update
+  
+  # Workload permissions (Deployments, StatefulSets, ReplicaSets)
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+      - statefulsets
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  
+  # Lease permissions for distributed coordination
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  
+  # Secret permissions for authentication credentials
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+  
+  # Events for status updates
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: temporal-autoscaler-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: temporal-autoscaler-operator
+subjects:
+  - kind: ServiceAccount
+    name: temporal-autoscaler-operator
+    namespace: temporal-autoscaler-system

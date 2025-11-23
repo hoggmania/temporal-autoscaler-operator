@@ -1,0 +1,227 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: temporalscalers.scaling.example.com
+spec:
+  group: scaling.example.com
+  names:
+    kind: TemporalScaler
+    listKind: TemporalScalerList
+    plural: temporalscalers
+    singular: temporalscaler
+    shortNames:
+      - ts
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - scaleTargetRef
+                - triggers
+              properties:
+                scaleTargetRef:
+                  type: object
+                  required:
+                    - apiVersion
+                    - kind
+                    - name
+                  properties:
+                    apiVersion:
+                      type: string
+                      description: API version of the target resource
+                    kind:
+                      type: string
+                      description: Kind of the target resource (Deployment, StatefulSet, ReplicaSet)
+                    name:
+                      type: string
+                      description: Name of the target resource
+                pollingInterval:
+                  type: integer
+                  description: Polling interval in seconds
+                  default: 5
+                  minimum: 1
+                cooldownPeriod:
+                  type: integer
+                  description: Cooldown period in seconds before scaling down
+                  default: 10
+                  minimum: 0
+                minReplicaCount:
+                  type: integer
+                  description: Minimum number of replicas
+                  default: 0
+                  minimum: 0
+                maxReplicaCount:
+                  type: integer
+                  description: Maximum number of replicas
+                  default: 10
+                  minimum: 1
+                advanced:
+                  type: object
+                  properties:
+                    horizontalPodAutoscalerConfig:
+                      type: object
+                      properties:
+                        behavior:
+                          type: object
+                          properties:
+                            scaleDown:
+                              type: object
+                              properties:
+                                stabilizationWindowSeconds:
+                                  type: integer
+                                  description: Stabilization window for scale down in seconds
+                                  default: 10
+                                  minimum: 0
+                            scaleUp:
+                              type: object
+                              properties:
+                                stabilizationWindowSeconds:
+                                  type: integer
+                                  description: Stabilization window for scale up in seconds
+                                  default: 0
+                                  minimum: 0
+                triggers:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - metadata
+                    properties:
+                      type:
+                        type: string
+                        enum:
+                          - temporal
+                        description: Trigger type (only temporal supported)
+                      metadata:
+                        type: object
+                        required:
+                          - taskQueue
+                          - targetQueueSize
+                        properties:
+                          endpoint:
+                            type: string
+                            description: Temporal frontend gRPC endpoint (host:port)
+                          endpointFromEnv:
+                            type: string
+                            description: Environment variable name containing the Temporal endpoint
+                          namespace:
+                            type: string
+                            description: Temporal namespace
+                            default: default
+                          taskQueue:
+                            type: string
+                            description: Name of the Temporal task queue to monitor
+                          queueTypes:
+                            type: string
+                            description: Queue types to monitor (workflow, activity, or both)
+                            default: workflow
+                          targetQueueSize:
+                            type: string
+                            description: Target queue size per replica
+                          activationTargetQueueSize:
+                            type: string
+                            description: Minimum queue size to activate scaling from zero
+                            default: "0"
+                          buildId:
+                            type: string
+                            description: Temporal build ID filter
+                          selectAllActive:
+                            type: string
+                            description: Select all active workers (true/false)
+                          selectUnversioned:
+                            type: string
+                            description: Select unversioned workers (true/false)
+                          minConnectTimeout:
+                            type: string
+                            description: Minimum connection timeout for Temporal client
+                          unsafeSsl:
+                            type: string
+                            description: Disable SSL verification (true/false)
+                          tlsServerName:
+                            type: string
+                            description: TLS server name for mTLS
+                          apiKey:
+                            type: string
+                            description: Temporal API key (for Temporal Cloud)
+                          apiKeyFromEnv:
+                            type: string
+                            description: Environment variable containing Temporal API key
+                          ca:
+                            type: string
+                            description: CA certificate for mTLS
+                          cert:
+                            type: string
+                            description: Client certificate for mTLS
+                          key:
+                            type: string
+                            description: Client private key for mTLS
+                          keyPassword:
+                            type: string
+                            description: Password for client private key
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                currentReplicas:
+                  type: integer
+                  description: Current number of replicas
+                desiredReplicas:
+                  type: integer
+                  description: Desired number of replicas
+                lastScaleTime:
+                  type: string
+                  format: date-time
+                  description: Timestamp of last scaling operation
+                observedGeneration:
+                  type: integer
+                  description: Observed generation of the resource
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: ScaleTarget
+          type: string
+          description: Target resource to scale
+          jsonPath: .spec.scaleTargetRef.name
+        - name: Min
+          type: integer
+          description: Minimum replicas
+          jsonPath: .spec.minReplicaCount
+        - name: Max
+          type: integer
+          description: Maximum replicas
+          jsonPath: .spec.maxReplicaCount
+        - name: Current
+          type: integer
+          description: Current replicas
+          jsonPath: .status.currentReplicas
+        - name: Desired
+          type: integer
+          description: Desired replicas
+          jsonPath: .status.desiredReplicas
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

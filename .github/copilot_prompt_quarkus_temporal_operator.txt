@@ -1,0 +1,175 @@
+# Copilot prompt: Generate a Java Quarkus Kubernetes Operator for Temporal-driven scaling
+
+Goal
+----
+Create a production-ready Java Quarkus-based Kubernetes Operator that:
+- Watches a custom resource (CRD) describing Temporal-based scaling triggers (see schema below).
+- Uses the Kubernetes Leases API (coordination.k8s.io/v1 Lease objects) to coordinate leader/lock among operator replicas and prevent double-scaling.
+- Queries a Temporal frontend (gRPC) to read Task Queue sizes (Workflow or Activity queues) and decides scaling actions.
+- Scales the target Kubernetes workload (Deployment / StatefulSet / ReplicaSet) up and down by patching the `spec.replicas` value on the target resource.
+- Supports multiple triggers and several taskQueue instances that may need independent scaling.
+- Includes authentication options (apiKey via Secret or mTLS certs), connect-timeout, and version selectors (buildId, selectAllActive, selectUnversioned).
+- Exposes metrics (Prometheus) and health/readiness endpoints, and includes unit/integration tests.
+
+Constraints & non-functional requirements
+---------------------------------------
+- Must be implemented using Quarkus (preferably Quarkus 3.x) and the Java Operator SDK (or fabric8 + controller pattern). Use Java 17+.
+- Use the Kubernetes Leases API for distributed coordination (not ConfigMaps or Endpoints). Acquire a Lease per target-scaled-object (or a single global Lease with per-target keys) before executing a scale operation.
+- Temporal client: use official Java Temporal client (`io.temporal:temporal-serviceclient` or appropriate artifact) and gRPC to the provided endpoint.
+- Respect `activationTargetQueueSize` to decide whether to activate scaling from zero.
+- Never scale below `minReplicaCount` configured on the CR/ScaledObject.
+- Provide safe defaults and guardrails for scaling to zero (cooldownPeriod, stabilization windows).
+- Implement exponential backoff and retry for Temporal queries and K8s patch operations.
+- Keep RBAC minimal but correct (leases, get/list/watch/patch/update for workloads, secrets for auth, create/get/patch leases).
+
+Top-level deliverables (files to generate)
+------------------------------------------
+- `pom.xml` (Maven Quarkus project with dependencies: quarkus-core, quarkus-arc, quarkus-resteasy-reactive, quarkus-smallrye-health, quarkus-smallrye-metrics, java-operator-sdk-quarkus-extension OR fabric8, kubernetes-client, io.temporal:temporal-serviceclient, jackson/yaml, micrometer/prometheus)
+- `src/main/java/.../OperatorApplication.java` (Quarkus main + registration of controllers)
+- `src/main/java/.../controller/TemporalScalerController.java` (Kubernetes controller reconciler that watches the CRD and drives scaling decisions)
+- `src/main/java/.../controller/LeaseCoordinator.java` (abstraction to acquire/release Lease objects per target)
+- `src/main/java/.../temporal/TemporalClientFacade.java` (wraps Temporal SDK calls to query task queue metrics and handles auth)
+- `src/main/java/.../model/TemporalTriggerSpec.java` (POJO mapping for spec fields shown below)
+- `src/main/resources/META-INF/kubernetes` (K8s manifests + operator deployment YAML)
+- `deploy/crd/temporal-autoscaler-crd.yaml` (CustomResourceDefinition matching the spec in the user prompt)
+- `deploy/role.yaml`, `deploy/rolebinding.yaml`, `deploy/operator-deployment.yaml`, `deploy/secret-sample.yaml`
+- `README.md` with architecture, configuration, example CR, and deployment instructions
+- Unit tests (`src/test/java/...`) for LeaseCoordinator and TemporalClientFacade (use mocks)
+
+CRD and example Custom Resource (must match user spec)
+-----------------------------------------------------
+Provide CRD with fields matching the user's `triggers` example. Example `TemporalTriggerSpec` fields:
+- endpoint | endpointFromEnv
+- namespace
+- taskQueue
+- queueTypes
+- targetQueueSize
+- activationTargetQueueSize
+- buildId
+- selectAllActive
+- selectUnversioned
+- minConnectTimeout
+- unsafeSsl
+- tlsServerName
+- apiKey | apiKeyFromEnv
+- ca, cert, key, keyPassword
+
+Example CR (YAML) to include in `deploy/examples/`:
+```yaml
+apiVersion: scaling.example.com/v1alpha1
+kind: TemporalScaler
+metadata:
+  name: workflow-scalers
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-worker-deployment
+  pollingInterval: 5
+  cooldownPeriod: 10
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 10
+  triggers:
+    - type: temporal
+      metadata:
+        namespace: default
+        taskQueue: "workflow_with_single_noop_activity:test"
+        targetQueueSize: "2"
+        activationTargetQueueSize: "0"
+        endpoint: temporal-frontend.temporal.svc.cluster.local:7233
+``` 
+
+Behavior & controller logic (detailed)
+--------------------------------------
+1. Reconcile loop receives a TemporalScaler CR (the custom resource). For each `trigger` of type `temporal`, create an internal watch job.
+2. For each trigger instance poll the Temporal frontend every `pollingInterval` seconds (configurable on CR). Query the task queue length for the specific `taskQueue` and `queueTypes`:
+   - Use Temporal gRPC query: listTaskQueuePartitions / getTaskQueueUserLevelStats (note: implement using the Temporal Java SDK; if API differs, create an adapter `TemporalClientFacade` that calls the appropriate RPC). Handle `buildId`, `selectAllActive`, `selectUnversioned` as filters.
+3. Determine desired replicas:
+   - If `queueLength` &gt; `targetQueueSize` * currentReplicas -> desiredReplicas = ceil(queueLength / targetQueueSize)
+   - Enforce `minReplicaCount` and `maxReplicaCount`.
+   - Activation: if currentReplicas == 0 and `queueLength` &gt;= `activationTargetQueueSize` then allow scale-up. If `selectAllActive` or `selectUnversioned` change selection behavior, use them as filters when reading queue size.
+4. Acquire a Lease for that target (name pattern: `temporal-scaler-<namespace>-<targetName>-<taskQueue>`). Use Lease to ensure only one operator instance performs the patch.
+   - Lease TTL should be longer than the reconcile / poll interval but short enough to allow failover (configurable).
+   - On successful acquire: patch target workload `spec.replicas` using a JSON Merge Patch or Strategic Merge Patch.
+   - Release the Lease if scaling operation completes. If lease cannot be acquired, skip this reconcile — the leader will perform work.
+5. Emit metrics: currentQueueLength, targetReplicas, currentReplicas, lastScaleTime, leaseOwner.
+6. Respect `cooldownPeriod` and HPA stabilization settings: don't scale more often than `pollingInterval` and don't scale down too aggressively. Optionally integrate with K8s HPA objects if the user wants a hybrid approach.
+7. Authentication:
+   - If `apiKey`/`apiKeyFromEnv` present, pass it as metadata/header or appropriate Temporal Cloud auth mechanism.
+   - If mTLS certs present, configure the Temporal gRPC client with the TLS material (client cert and key + CA) and `tlsServerName` if set.
+
+RBAC & Security
+---------------
+- ClusterRole must allow:
+  - `get,list,watch,patch,update` for Deployments/StatefulSets/ReplicaSets in the operator's namespace/scope.
+  - `create,get,update,patch` for `leases` in `coordination.k8s.io/v1`.
+  - `get,list,watch` for Secrets (for auth)
+
+High level implementation hints (code snippets in Java)
+-----------------------------------------------------
+- Use Java Operator SDK Reconciler interface (or fabric8 informers + controller loop) and Quarkus CDI for injection.
+- Lease acquisition sketch using fabric8 Kubernetes Client:
+```java
+public boolean acquireLease(KubernetesClient client, String leaseName, String ownerId, Duration leaseDuration) {
+    Lease existing = client.leases().inNamespace(ns).withName(leaseName).get();
+    long ts = Instant.now().getEpochSecond();
+    if (existing == null) {
+        Lease newLease = new LeaseBuilder()
+            .withNewMetadata().withName(leaseName).endMetadata()
+            .withNewSpec()
+              .withHolderIdentity(ownerId)
+              .withLeaseDurationSeconds((int)leaseDuration.getSeconds())
+              .withAcquireTime(new MicroTime("" + ts))
+            .endSpec()
+            .build();
+        client.leases().inNamespace(ns).create(newLease);
+        return true;
+    }
+    // check expiry and try to update with optimistic concurrency (resourceVersion)
+    // update holderIdentity to ownerId if expired
+    return tryUpdateLease(client, existing, ownerId, leaseDuration);
+}
+```
+
+- Temporal client example (high-level):
+```java
+WorkflowServiceStubsOptions.Builder opts = WorkflowServiceStubsOptions.newBuilder()
+    .setTarget(endpoint)
+    .setChannel(ManagedChannelBuilder.forTarget(endpoint).usePlaintext().build());
+// apply TLS / mTLS if needed
+ServiceStubs stubs = WorkflowServiceStubs.newServiceStubs(opts.build());
+WorkflowServiceBlockingStub blocking = WorkflowServiceGrpc.newBlockingStub(stubs.getChannel());
+// call appropriate RPC (example only — wrap with facade and fallback)
+```
+
+What the Copilot output must include
+-----------------------------------
+- A complete Quarkus Maven project tree that compiles with `mvn -DskipTests=true package` (or clear TODOs where human input is required for credentials).
+- The CRD and an example CR YAML.
+- A clear README describing: how to build, run locally (Minikube or Kind), how to configure Temporal endpoint (example env var or Secret), and how to deploy RBAC and operator.
+- Unit tests and at least one integration test skeleton (you may stub Temporal responses using a mock server or test fixture).
+- Comments in code explaining safety choices (scaling to zero caveat, Lease TTL choice, retry/backoff policy).
+
+Edge cases & safety checks to implement
+-------------------------------------
+- If Temporal queries return transient errors, don't immediately scale to zero; retry with exponential backoff and log.
+- When scaling down to zero, ensure a configurable cooldown period since last activity and honor activation thresholds for scale-up.
+- When multiple triggers target the same workload, compute desired replicas as the max of all trigger-suggested replicas.
+- Validate CR inputs and reject invalid combinations (e.g., both endpoint and endpointFromEnv set, or invalid numeric values in metadata).
+
+Developer & testing notes
+-------------------------
+- Provide a `dev` profile that runs Quarkus in dev mode and points to a configurable mock Temporal gRPC server for integration testing.
+- Provide `make` or simple scripts: `./mvnw package`, `./mvnw quarkus:dev`, `scripts/kind-setup.sh` to create CRD and RBAC for integration tests.
+
+Finish
+------
+Return a single multi-file Quarkus operator project (in the code output). If any part cannot be fully implemented because of missing third-party details (e.g., exact Temporal gRPC method names for task queue size), include a small TODO in the facade with instructions and references for which RPC to use and how to test.
+
+--- END OF COPILOT PROMPT ---

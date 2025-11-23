@@ -1,0 +1,61 @@
+apiVersion: scaling.example.com/v1alpha1
+kind: TemporalScaler
+metadata:
+  name: workflow-scalers
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-worker-deployment
+  pollingInterval: 5
+  cooldownPeriod: 10
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 10
+  triggers:
+    - type: temporal
+      metadata:
+        namespace: default
+        taskQueue: "workflow_with_single_noop_activity:test"
+        targetQueueSize: "2"
+        activationTargetQueueSize: "0"
+        endpoint: temporal-frontend.temporal.svc.cluster.local:7233
+---
+apiVersion: scaling.example.com/v1alpha1
+kind: TemporalScaler
+metadata:
+  name: multi-trigger-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: multi-queue-worker
+  pollingInterval: 10
+  cooldownPeriod: 30
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  triggers:
+    - type: temporal
+      metadata:
+        endpointFromEnv: TEMPORAL_ENDPOINT
+        namespace: production
+        taskQueue: "high-priority-queue"
+        targetQueueSize: "5"
+        activationTargetQueueSize: "1"
+        apiKeyFromEnv: TEMPORAL_API_KEY
+        tlsServerName: temporal.example.com
+    - type: temporal
+      metadata:
+        endpointFromEnv: TEMPORAL_ENDPOINT
+        namespace: production
+        taskQueue: "low-priority-queue"
+        targetQueueSize: "10"
+        activationTargetQueueSize: "5"
+        apiKeyFromEnv: TEMPORAL_API_KEY
+        tlsServerName: temporal.example.com

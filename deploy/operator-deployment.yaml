@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: temporal-autoscaler-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-autoscaler-operator
+  namespace: temporal-autoscaler-system
+  labels:
+    app: temporal-autoscaler-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: temporal-autoscaler-operator
+  template:
+    metadata:
+      labels:
+        app: temporal-autoscaler-operator
+    spec:
+      serviceAccountName: temporal-autoscaler-operator
+      containers:
+        - name: operator
+          image: temporal-autoscaler-operator:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: QUARKUS_KUBERNETES_CLIENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          # Optional: Configure Temporal endpoint via environment
+          # - name: TEMPORAL_ENDPOINT
+          #   value: temporal-frontend.temporal.svc.cluster.local:7233
+          # - name: TEMPORAL_API_KEY
+          #   valueFrom:
+          #     secretKeyRef:
+          #       name: temporal-credentials
+          #       key: api-key
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /q/health/live
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /q/health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      # Optional: Add node affinity or tolerations
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #       - matchExpressions:
+      #         - key: node-role.kubernetes.io/master
+      #           operator: Exists
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-autoscaler-operator
+  namespace: temporal-autoscaler-system
+  labels:
+    app: temporal-autoscaler-operator
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: temporal-autoscaler-operator
