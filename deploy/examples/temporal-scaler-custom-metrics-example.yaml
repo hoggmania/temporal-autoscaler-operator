@@ -1,0 +1,141 @@
+---
+apiVersion: scaling.example.com/v1alpha1
+kind: TemporalScaler
+metadata:
+  name: order-processor-scaler
+  namespace: default
+spec:
+  # Target workload to scale
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-processor-workers
+
+  # Scaling parameters
+  pollingInterval: 10           # Query metrics every 10 seconds
+  cooldownPeriod: 30            # Wait 30 seconds between scale operations
+  minReplicaCount: 1            # Keep at least 1 replica
+  maxReplicaCount: 20           # Maximum 20 replicas
+
+  # Optional: HPA-style behavior
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 60  # Wait 60s before scaling down
+
+  # Temporal triggers with custom metrics
+  triggers:
+    - type: temporal
+      metadata:
+        # Temporal connection
+        endpoint: temporal-frontend.temporal.svc.cluster.local:7233
+        namespace: default
+        taskQueue: "order-processing-queue"
+        queueTypes: "workflow"
+        
+        # Authentication
+        apiKeyFromEnv: TEMPORAL_API_KEY
+      
+      # Custom metrics scaling
+      customMetrics:
+        # Scale based on workflow execution rate
+        - metricType: workflow_execution_rate
+          workflowType: OrderProcessingWorkflow
+          targetValue: 100.0              # Target: 100 workflows/second per replica
+          activationValue: 10.0           # Activate from zero at 10 workflows/second
+          timeWindowSeconds: 60           # Calculate rate over 60 seconds
+          aggregation: average            # Use average rate
+        
+        # Scale based on workflow success rate
+        - metricType: workflow_success_rate
+          workflowType: OrderProcessingWorkflow
+          targetValue: 99.0               # Maintain 99% success rate
+          activationValue: 95.0           # Activate if success rate < 95%
+          timeWindowSeconds: 300          # Calculate over 5 minutes
+          aggregation: average
+        
+        # Scale based on p95 workflow latency
+        - metricType: workflow_latency
+          workflowType: OrderProcessingWorkflow
+          targetValue: 5000.0             # Target: p95 latency under 5 seconds
+          activationValue: 10000.0        # Activate if p95 > 10 seconds
+          timeWindowSeconds: 120          # Calculate over 2 minutes
+          aggregation: percentile
+          percentile: 95.0                # p95 latency
+---
+apiVersion: scaling.example.com/v1alpha1
+kind: TemporalScaler
+metadata:
+  name: payment-processor-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-processor-workers
+
+  pollingInterval: 5
+  cooldownPeriod: 20
+  minReplicaCount: 2            # Keep 2 replicas for high availability
+  maxReplicaCount: 30
+
+  triggers:
+    - type: temporal
+      metadata:
+        endpoint: temporal-frontend.temporal.svc.cluster.local:7233
+        namespace: default
+        taskQueue: "payment-processing-queue"
+        queueTypes: "activity"
+        apiKeyFromEnv: TEMPORAL_API_KEY
+      
+      customMetrics:
+        # Scale based on activity execution rate
+        - metricType: activity_execution_rate
+          activityType: ProcessPaymentActivity
+          targetValue: 50.0               # Target: 50 activities/second per replica
+          activationValue: 5.0
+          timeWindowSeconds: 60
+          aggregation: average
+        
+        # Scale based on activity error rate
+        - metricType: activity_error_rate
+          activityType: ProcessPaymentActivity
+          targetValue: 0.5                # Keep errors below 0.5%
+          activationValue: 2.0            # Activate if errors > 2%
+          timeWindowSeconds: 300          # Calculate over 5 minutes
+          aggregation: average
+---
+apiVersion: scaling.example.com/v1alpha1
+kind: TemporalScaler
+metadata:
+  name: custom-metric-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: custom-workers
+
+  pollingInterval: 15
+  cooldownPeriod: 30
+  minReplicaCount: 0            # Allow scale to zero
+  maxReplicaCount: 10
+
+  triggers:
+    - type: temporal
+      metadata:
+        endpoint: temporal-frontend.temporal.svc.cluster.local:7233
+        namespace: default
+        taskQueue: "custom-queue"
+        queueTypes: "workflow"
+        apiKeyFromEnv: TEMPORAL_API_KEY
+      
+      customMetrics:
+        # Scale based on custom metric from external system (e.g., Prometheus)
+        - metricType: custom
+          metricName: custom_business_metric
+          targetValue: 1000.0             # Custom threshold
+          activationValue: 100.0
+          timeWindowSeconds: 60
+          aggregation: sum                # Sum metric values

@@ -167,6 +167,60 @@ spec:
                           keyPassword:
                             type: string
                             description: Password for client private key
+                      customMetrics:
+                        type: array
+                        description: Custom metrics for advanced scaling (overrides queue-based scaling)
+                        items:
+                          type: object
+                          required:
+                            - metricType
+                            - targetValue
+                          properties:
+                            metricType:
+                              type: string
+                              enum:
+                                - workflow_execution_rate
+                                - workflow_success_rate
+                                - workflow_latency
+                                - activity_execution_rate
+                                - activity_error_rate
+                                - custom
+                              description: Type of custom metric
+                            metricName:
+                              type: string
+                              description: Name of custom metric (required for metricType=custom)
+                            targetValue:
+                              type: number
+                              description: Target value for the metric
+                            activationValue:
+                              type: number
+                              description: Activation threshold to scale from zero
+                            workflowType:
+                              type: string
+                              description: Filter metrics by workflow type
+                            activityType:
+                              type: string
+                              description: Filter metrics by activity type
+                            timeWindowSeconds:
+                              type: integer
+                              description: Time window for rate calculations in seconds
+                              default: 60
+                              minimum: 1
+                            aggregation:
+                              type: string
+                              enum:
+                                - average
+                                - sum
+                                - max
+                                - min
+                                - percentile
+                              description: Aggregation method for metric values
+                              default: average
+                            percentile:
+                              type: number
+                              description: Percentile value for percentile aggregation (0-100)
+                              minimum: 0
+                              maximum: 100
             status:
               type: object
               properties:

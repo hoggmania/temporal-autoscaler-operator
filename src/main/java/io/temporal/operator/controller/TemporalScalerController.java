@@ -31,7 +31,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * Responsibilities:
  * - Watch TemporalScaler CRs and process triggers
  * - Query Temporal task queues for backlog sizes
- * - Calculate desired replica counts based on queue metrics
+ * - Query custom metrics from Temporal (execution rates, latencies, etc.)
+ * - Calculate desired replica counts based on queue metrics or custom metrics
  * - Coordinate scaling operations using Kubernetes Leases
  * - Update target workload (Deployment/StatefulSet) replicas
  * - Maintain status and emit metrics
@@ -42,6 +43,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * - Uses stabilization windows from HPA config
  * - Acquires leases before scaling to prevent concurrent modifications
  * - Handles multiple triggers by taking max desired replicas
+ * - Supports both queue-based and custom metric-based scaling
  */
 @ControllerConfiguration
 public class TemporalScalerController implements Reconciler<TemporalScaler>, ErrorStatusHandler<TemporalScaler> {
@@ -168,37 +170,47 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
                 // Build Temporal connection config from trigger metadata
                 TemporalConnectionConfig config = buildTemporalConfig(trigger, resource.getMetadata().getNamespace());
 
-                // Query task queue size
-                long queueSize = temporalClient.getTaskQueueSize(config);
-                
-                if (queueSize < 0) {
-                    log.warn("Failed to get queue size for trigger, skipping");
-                    continue;
+                int triggerDesired = currentReplicas;
+
+                // Check if trigger has custom metrics
+                if (trigger.getCustomMetrics() != null && !trigger.getCustomMetrics().isEmpty()) {
+                    // Process custom metrics
+                    triggerDesired = calculateReplicasFromCustomMetrics(
+                        trigger, config, currentReplicas, resourceKey);
+                    hasValidMetric = true;
+                } else {
+                    // Default: use queue backlog
+                    long queueSize = temporalClient.getTaskQueueSize(config);
+                    
+                    if (queueSize < 0) {
+                        log.warn("Failed to get queue size for trigger, skipping");
+                        continue;
+                    }
+
+                    hasValidMetric = true;
+
+                    // Update metrics
+                    String metricKey = resourceKey + "-" + config.getTaskQueue();
+                    updateQueueSizeGauge(metricKey, queueSize);
+
+                    // Parse target queue size
+                    int targetQueueSize = Integer.parseInt(
+                        trigger.getMetadataValue("targetQueueSize", "1"));
+                    
+                    // Parse activation target
+                    int activationTarget = Integer.parseInt(
+                        trigger.getMetadataValue("activationTargetQueueSize", "0"));
+
+                    // Calculate desired replicas for this trigger
+                    triggerDesired = calculateReplicasForTrigger(
+                        queueSize, targetQueueSize, activationTarget, currentReplicas);
+
+                    log.debug("Trigger {} queue size: {}, target: {}, desired replicas: {}", 
+                        config.getTaskQueue(), queueSize, targetQueueSize, triggerDesired);
                 }
 
-                hasValidMetric = true;
-
-                // Update metrics
-                String metricKey = resourceKey + "-" + config.getTaskQueue();
-                updateQueueSizeGauge(metricKey, queueSize);
-
-                // Parse target queue size
-                int targetQueueSize = Integer.parseInt(
-                    trigger.getMetadataValue("targetQueueSize", "1"));
-                
-                // Parse activation target
-                int activationTarget = Integer.parseInt(
-                    trigger.getMetadataValue("activationTargetQueueSize", "0"));
-
-                // Calculate desired replicas for this trigger
-                int desired = calculateReplicasForTrigger(
-                    queueSize, targetQueueSize, activationTarget, currentReplicas);
-
-                log.debug("Trigger {} queue size: {}, target: {}, desired replicas: {}", 
-                    config.getTaskQueue(), queueSize, targetQueueSize, desired);
-
                 // Take max across all triggers
-                maxDesired = Math.max(maxDesired, desired);
+                maxDesired = Math.max(maxDesired, triggerDesired);
 
             } catch (Exception e) {
                 log.error("Error processing trigger: {}", e.getMessage(), e);
@@ -224,7 +236,70 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
     }
 
     /**
-     * Calculate desired replicas for a single trigger.
+     * Calculate desired replicas based on custom metrics.
+     */
+    private int calculateReplicasFromCustomMetrics(Trigger trigger, 
+                                                   TemporalConnectionConfig config,
+                                                   int currentReplicas,
+                                                   String resourceKey) {
+        int maxDesired = currentReplicas;
+
+        for (CustomMetric metric : trigger.getCustomMetrics()) {
+            try {
+                double metricValue = temporalClient.getCustomMetricValue(config, metric);
+                
+                if (metricValue < 0) {
+                    log.warn("Failed to get custom metric {}, skipping", metric.getMetricType());
+                    continue;
+                }
+
+                // Calculate desired replicas based on metric
+                int desired = calculateReplicasForCustomMetric(
+                    metricValue, metric, currentReplicas);
+
+                log.debug("Custom metric {} value: {}, target: {}, desired replicas: {}", 
+                    metric.getMetricType(), metricValue, metric.getTargetValue(), desired);
+
+                // Take max across all metrics
+                maxDesired = Math.max(maxDesired, desired);
+
+            } catch (Exception e) {
+                log.error("Error processing custom metric {}: {}", 
+                    metric.getMetricType(), e.getMessage(), e);
+            }
+        }
+
+        return maxDesired;
+    }
+
+    /**
+     * Calculate desired replicas for a custom metric.
+     */
+    private int calculateReplicasForCustomMetric(double metricValue, 
+                                                CustomMetric metric,
+                                                int currentReplicas) {
+        // Handle scale-from-zero activation
+        if (currentReplicas == 0) {
+            if (metric.getActivationValue() != null && metricValue >= metric.getActivationValue()) {
+                // Activate: calculate initial replicas
+                return Math.max(1, (int) Math.ceil(metricValue / metric.getTargetValue()));
+            } else {
+                return 0;
+            }
+        }
+
+        // Normal scaling logic
+        if (metricValue == 0) {
+            // Scale to zero if allowed
+            return 0;
+        }
+
+        // Calculate replicas needed: ceil(metricValue / targetValue)
+        return (int) Math.ceil(metricValue / metric.getTargetValue());
+    }
+
+    /**
+     * Calculate desired replicas for a single trigger (queue-based).
      */
     private int calculateReplicasForTrigger(long queueSize, int targetQueueSize, 
                                            int activationTarget, int currentReplicas) {

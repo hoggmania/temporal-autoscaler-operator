@@ -1,0 +1,20 @@
+apiVersion: v2
+name: temporal-autoscaler-operator
+description: A Kubernetes operator that automatically scales workloads based on Temporal task queue metrics
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - temporal
+  - autoscaler
+  - operator
+  - kubernetes
+  - openshift
+home: https://github.com/hoggmania/temporal-autoscaler-operator
+sources:
+  - https://github.com/hoggmania/temporal-autoscaler-operator
+maintainers:
+  - name: hoggmania
+    url: https://github.com/hoggmania
+icon: https://docs.temporal.io/img/temporal-logo.svg
+kubeVersion: ">=1.21.0-0"
