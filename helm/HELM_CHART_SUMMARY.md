@@ -65,6 +65,12 @@ helm/temporal-autoscaler-operator/
 - **TLS/mTLS**: Support for secure Temporal connections
 - **Pod Security**: Compatible with restricted security standards
 
+### 5. Worker Versioning Awareness
+
+- **Backlog source**: Prefers Temporal's Worker Deployment + Versioning Rules APIs for queue stats
+- **Automatic discovery**: Resolves build IDs/deployments directly from Temporal instead of requiring CRD fields
+- **Graceful fallback**: Uses `DescribeTaskQueue` with enhanced stats only when Worker Versioning RPCs are unavailable
+
 ## Installation
 
 ### Quick Install on Kubernetes

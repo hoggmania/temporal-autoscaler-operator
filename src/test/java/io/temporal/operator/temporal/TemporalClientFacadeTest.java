@@ -59,18 +59,6 @@ class TemporalClientFacadeTest {
     }
 
     @Test
-    void testVersioningOptions() {
-        TemporalConnectionConfig config = new TemporalConnectionConfig();
-        config.setBuildId("v1.2.3");
-        config.setSelectAllActive(true);
-        config.setSelectUnversioned(false);
-
-        assertThat(config.getBuildId()).isEqualTo("v1.2.3");
-        assertThat(config.getSelectAllActive()).isTrue();
-        assertThat(config.getSelectUnversioned()).isFalse();
-    }
-
-    @Test
     void testUnsafeSslConfig() {
         TemporalConnectionConfig config = new TemporalConnectionConfig();
         config.setUnsafeSsl(true);

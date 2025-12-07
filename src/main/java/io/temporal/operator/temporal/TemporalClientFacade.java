@@ -1,10 +1,28 @@
 package io.temporal.operator.temporal;
 
+import com.google.protobuf.ByteString;
 import io.grpc.Metadata;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.MetadataUtils;
+import io.temporal.api.deployment.v1.WorkerDeploymentInfo;
+import io.temporal.api.deployment.v1.WorkerDeploymentVersion;
+import io.temporal.api.enums.v1.DescribeTaskQueueMode;
+import io.temporal.api.enums.v1.TaskQueueType;
+import io.temporal.api.taskqueue.v1.TaskQueueStats;
+import io.temporal.api.taskqueue.v1.TaskQueueStatus;
+import io.temporal.api.taskqueue.v1.TimestampedBuildIdAssignmentRule;
+import io.temporal.api.taskqueue.v1.TimestampedCompatibleBuildIdRedirectRule;
 import io.temporal.api.workflowservice.v1.DescribeTaskQueueRequest;
 import io.temporal.api.workflowservice.v1.DescribeTaskQueueResponse;
-import io.temporal.api.enums.v1.TaskQueueType;
+import io.temporal.api.workflowservice.v1.DescribeWorkerDeploymentRequest;
+import io.temporal.api.workflowservice.v1.DescribeWorkerDeploymentVersionRequest;
+import io.temporal.api.workflowservice.v1.DescribeWorkerDeploymentVersionResponse;
+import io.temporal.api.workflowservice.v1.GetWorkerVersioningRulesRequest;
+import io.temporal.api.workflowservice.v1.GetWorkerVersioningRulesResponse;
+import io.temporal.api.workflowservice.v1.ListWorkerDeploymentsRequest;
+import io.temporal.api.workflowservice.v1.ListWorkerDeploymentsResponse;
+import io.temporal.api.workflowservice.v1.WorkflowServiceGrpc;
 import io.temporal.operator.model.CustomMetric;
 import io.temporal.serviceclient.WorkflowServiceStubs;
 import io.temporal.serviceclient.WorkflowServiceStubsOptions;
@@ -17,7 +35,14 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
@@ -37,8 +62,6 @@ import io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder;
  * - Query custom metrics (workflow rates, latencies, etc.)
  * - Exponential backoff for transient errors
  * - Configurable timeouts
- * 
- * TODO: Actual queue size calculation depends on Temporal version.
  * For Temporal 1.20+, use DescribeTaskQueue with TaskQueueMetadata.
  * For older versions or specific queue stats, may need different approach.
  * Test with your Temporal version and adjust as needed.
@@ -62,41 +85,23 @@ public class TemporalClientFacade {
      */
     public long getTaskQueueSize(TemporalConnectionConfig config) {
         try {
+            if (config.getEndpoint() == null || config.getEndpoint().isBlank()) {
+                log.warn("Cannot query Temporal queue size: endpoint is missing");
+                return -1;
+            }
             WorkflowServiceStubs stubs = getOrCreateStubs(config);
 
-            // Build request for task queue description
-            DescribeTaskQueueRequest.Builder requestBuilder = DescribeTaskQueueRequest.newBuilder()
-                    .setNamespace(config.getNamespace())
-                    .setTaskQueue(io.temporal.api.taskqueue.v1.TaskQueue.newBuilder()
-                            .setName(config.getTaskQueue())
-                            .build());
-
-            // Add task queue type filter
-            if (config.getQueueTypes() != null) {
-                String queueTypes = config.getQueueTypes().toLowerCase();
-                if (queueTypes.contains("workflow")) {
-                    requestBuilder.setTaskQueueType(TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW);
-                } else if (queueTypes.contains("activity")) {
-                    requestBuilder.setTaskQueueType(TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY);
-                }
+            Long workerVersioningBacklog = queryWorkerVersioningBacklog(stubs, config);
+            if (workerVersioningBacklog != null) {
+                log.debug("Worker versioning backlog for {}#{} resolved to {}",
+                        config.getNamespace(), config.getTaskQueue(), workerVersioningBacklog);
+                return workerVersioningBacklog;
             }
 
-            // setReportStats is required for calculating the backlog
-            DescribeTaskQueueRequest request = requestBuilder.setReportStats(true).build();
-
-            // Execute query with timeout
-            DescribeTaskQueueResponse response = stubs.blockingStub()
-                    .withDeadlineAfter(DEFAULT_TIMEOUT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
-                    .describeTaskQueue(request);
-
-            // Calculate backlog size
-            long backlogSize = calculateBacklogSize(response, config);
-
-            log.debug("Task queue {} in namespace {} has backlog size: {}",
-                    config.getTaskQueue(), config.getNamespace(), backlogSize);
-
-            return backlogSize;
-
+            long legacyBacklog = queryLegacyBacklog(stubs, config);
+            log.debug("Legacy backlog for {}#{} resolved to {}",
+                    config.getNamespace(), config.getTaskQueue(), legacyBacklog);
+            return legacyBacklog;
         } catch (Exception e) {
             log.error("Failed to query Temporal task queue {}: {}", config.getTaskQueue(), e.getMessage(), e);
             // Return -1 to indicate error - controller should handle gracefully
@@ -104,58 +109,297 @@ public class TemporalClientFacade {
         }
     }
 
-    /**
-     * Calculate backlog size from DescribeTaskQueueResponse.
-     * 
-     * TODO: This is a simplified implementation. Actual calculation may vary based
-     * on:
-     * - Temporal version
-     * - buildId filtering
-     * - selectAllActive / selectUnversioned flags
-     * 
-     * For production use, verify against your Temporal deployment.
-     */
-    private long calculateBacklogSize(DescribeTaskQueueResponse response, TemporalConnectionConfig config) {
-        long totalBacklog = 0;
+    private void applyQueueTypeFilters(DescribeTaskQueueRequest.Builder builder, String queueTypesConfig) {
+        EnumSet<TaskQueueType> requestedTypes = resolveQueueTypes(queueTypesConfig);
 
-        // In Temporal SDK 1.32+ -- stats are here
-        var status = response.getStats();
+        TaskQueueType legacyType = requestedTypes.contains(TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW)
+                ? TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW
+                : TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY;
+        builder.setTaskQueueType(legacyType);
 
-        if (status != null) {
-            totalBacklog = status.getApproximateBacklogCount();
-            double addRate = status.getTasksAddRate();
-            double dispatchRate = status.getTasksDispatchRate();
+        requestedTypes.forEach(builder::addTaskQueueTypes);
+    }
 
-            log.debug("Approx backlog: " + totalBacklog);
-            log.debug("Task add rate (/s): " + addRate);
-            log.debug("Task dispatch rate (/s): " + dispatchRate);
+    private EnumSet<TaskQueueType> resolveQueueTypes(String queueTypesConfig) {
+        boolean workflowRequested = false;
+        boolean activityRequested = false;
+
+        if (queueTypesConfig != null && !queueTypesConfig.isBlank()) {
+            String[] requestedTypes = queueTypesConfig.split(",");
+            for (String requestedType : requestedTypes) {
+                String normalized = requestedType.trim().toLowerCase(Locale.ROOT);
+                if ("workflow".equals(normalized)) {
+                    workflowRequested = true;
+                } else if ("activity".equals(normalized)) {
+                    activityRequested = true;
+                }
+            }
         }
 
-        // Note: Response structure varies by Temporal version
-        // This is a placeholder - adjust based on actual API
+        if (!workflowRequested && !activityRequested) {
+            workflowRequested = true;
+        }
 
-        // For recent Temporal versions, check TaskQueueMetadata
-        // The actual backlog is typically available in partition stats
+        EnumSet<TaskQueueType> requested = EnumSet.noneOf(TaskQueueType.class);
+        if (workflowRequested) {
+            requested.add(TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW);
+        }
+        if (activityRequested) {
+            requested.add(TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY);
+        }
+        return requested;
+    }
 
-        // Simplified: count based on metadata
-        // In real implementation, parse response.getPollers() or use alternative API
+    private long queryLegacyBacklog(WorkflowServiceStubs stubs, TemporalConnectionConfig config) {
+        DescribeTaskQueueRequest.Builder requestBuilder = DescribeTaskQueueRequest.newBuilder()
+                .setNamespace(config.getNamespace())
+                .setTaskQueue(io.temporal.api.taskqueue.v1.TaskQueue.newBuilder()
+                        .setName(config.getTaskQueue())
+                        .build())
+                .setIncludeTaskQueueStatus(true)
+                .setApiMode(DescribeTaskQueueMode.DESCRIBE_TASK_QUEUE_MODE_ENHANCED);
 
-        // Fallback: if metadata unavailable, check task count
-        // This part needs to be adapted based on actual Temporal API available
-        // For Temporal Cloud with versioning, filter by buildId if specified
+        applyQueueTypeFilters(requestBuilder, config.getQueueTypes());
 
-        // TODO: Implement proper backlog calculation based on:
-        // 1. response.getTaskQueueStatus() if available
-        // 2. Partition-level stats for accurate counts
-        // 3. Apply buildId, selectAllActive, selectUnversioned filters
+        DescribeTaskQueueRequest request = requestBuilder.setReportStats(true).build();
 
-        // Placeholder implementation:
-        // Assume approximateBacklogCount field (verify in your Temporal version)
-        // This is a simplified example - real field may differ
+        DescribeTaskQueueResponse response = stubs.blockingStub()
+                .withDeadlineAfter(DEFAULT_TIMEOUT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
+                .describeTaskQueue(request);
 
-        log.warn("Using placeholder backlog calculation. Implement proper logic based on Temporal version.");
+        return calculateBacklogSize(response);
+    }
 
-        // Return 0 for now - replace with actual calculation
+    private Long queryWorkerVersioningBacklog(WorkflowServiceStubs stubs, TemporalConnectionConfig config) {
+        WorkflowServiceGrpc.WorkflowServiceBlockingStub stubWithDeadline = stubs.blockingStub()
+                .withDeadlineAfter(DEFAULT_TIMEOUT.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+
+        try {
+            GetWorkerVersioningRulesResponse rulesResponse = stubWithDeadline.getWorkerVersioningRules(
+                    GetWorkerVersioningRulesRequest.newBuilder()
+                            .setNamespace(config.getNamespace())
+                            .setTaskQueue(config.getTaskQueue())
+                            .build());
+
+            Set<String> targetBuildIds = collectBuildIdsFromRules(rulesResponse);
+            if (targetBuildIds.isEmpty()) {
+                return null;
+            }
+
+            List<WorkerDeploymentVersion> deploymentVersions =
+                    resolveDeploymentVersions(stubWithDeadline, config, targetBuildIds);
+
+            if (deploymentVersions.isEmpty()) {
+                log.warn("Worker versioning rules resolved build IDs {} but no deployments were found in namespace {}",
+                        targetBuildIds, config.getNamespace());
+                return null;
+            }
+
+            EnumSet<TaskQueueType> requestedTypes = resolveQueueTypes(config.getQueueTypes());
+            long backlogTotal = 0;
+
+            for (WorkerDeploymentVersion deploymentVersion : deploymentVersions) {
+                DescribeWorkerDeploymentVersionResponse response = stubWithDeadline.describeWorkerDeploymentVersion(
+                        DescribeWorkerDeploymentVersionRequest.newBuilder()
+                                .setNamespace(config.getNamespace())
+                                .setDeploymentVersion(deploymentVersion)
+                                .setReportTaskQueueStats(true)
+                                .build());
+
+                long versionBacklog = response.getVersionTaskQueuesList().stream()
+                        .filter(taskQueue -> config.getTaskQueue().equals(taskQueue.getName()))
+                        .filter(taskQueue -> requestedTypes.contains(taskQueue.getType()))
+                        .mapToLong(this::calculateBacklogFromVersionQueue)
+                        .sum();
+
+                backlogTotal += versionBacklog;
+            }
+
+            return backlogTotal;
+        } catch (StatusRuntimeException e) {
+            if (e.getStatus().getCode() == Status.Code.UNIMPLEMENTED
+                    || e.getStatus().getCode() == Status.Code.INVALID_ARGUMENT) {
+                log.debug("Worker versioning backlog unavailable for namespace {} queue {}: {}",
+                        config.getNamespace(), config.getTaskQueue(), e.getMessage());
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    private Set<String> collectBuildIdsFromRules(GetWorkerVersioningRulesResponse response) {
+        Set<String> buildIds = new LinkedHashSet<>();
+
+        for (TimestampedBuildIdAssignmentRule assignmentRule : response.getAssignmentRulesList()) {
+            if (assignmentRule.hasRule()) {
+                addBuildId(buildIds, assignmentRule.getRule().getTargetBuildId());
+            }
+        }
+
+        for (TimestampedCompatibleBuildIdRedirectRule redirectRule : response.getCompatibleRedirectRulesList()) {
+            if (redirectRule.hasRule()) {
+                addBuildId(buildIds, redirectRule.getRule().getSourceBuildId());
+                addBuildId(buildIds, redirectRule.getRule().getTargetBuildId());
+            }
+        }
+
+        return buildIds;
+    }
+
+    private void addBuildId(Set<String> collector, String candidate) {
+        if (candidate == null) {
+            return;
+        }
+        String trimmed = candidate.trim();
+        if (!trimmed.isEmpty()) {
+            collector.add(trimmed);
+        }
+    }
+
+    private List<WorkerDeploymentVersion> resolveDeploymentVersions(
+            WorkflowServiceGrpc.WorkflowServiceBlockingStub stub,
+            TemporalConnectionConfig config,
+            Set<String> targetBuildIds) {
+
+        if (targetBuildIds.isEmpty()) {
+            return List.of();
+        }
+
+        Map<String, WorkerDeploymentVersion> resolvedVersions = new LinkedHashMap<>();
+        List<ListWorkerDeploymentsResponse.WorkerDeploymentSummary> summaries =
+                fetchAllWorkerDeployments(stub, config.getNamespace());
+
+        for (ListWorkerDeploymentsResponse.WorkerDeploymentSummary summary : summaries) {
+            addVersionSummary(summary.getLatestVersionSummary(), resolvedVersions);
+            addVersionSummary(summary.getCurrentVersionSummary(), resolvedVersions);
+            addVersionSummary(summary.getRampingVersionSummary(), resolvedVersions);
+        }
+
+        Set<String> unresolved = new LinkedHashSet<>(targetBuildIds);
+        unresolved.removeAll(resolvedVersions.keySet());
+
+        if (!unresolved.isEmpty()) {
+            for (ListWorkerDeploymentsResponse.WorkerDeploymentSummary summary : summaries) {
+                var describeResponse = stub.describeWorkerDeployment(
+                        DescribeWorkerDeploymentRequest.newBuilder()
+                                .setNamespace(config.getNamespace())
+                                .setDeploymentName(summary.getName())
+                                .build());
+
+                if (describeResponse.hasWorkerDeploymentInfo()) {
+                    for (WorkerDeploymentInfo.WorkerDeploymentVersionSummary versionSummary :
+                            describeResponse.getWorkerDeploymentInfo().getVersionSummariesList()) {
+                        addVersionSummary(versionSummary, resolvedVersions);
+                    }
+                }
+
+                unresolved.removeAll(resolvedVersions.keySet());
+                if (unresolved.isEmpty()) {
+                    break;
+                }
+            }
+        }
+
+        List<WorkerDeploymentVersion> ordered = new ArrayList<>();
+        for (String buildId : targetBuildIds) {
+            WorkerDeploymentVersion version = resolvedVersions.get(buildId);
+            if (version != null) {
+                ordered.add(version);
+            } else {
+                log.warn("Build ID {} referenced by worker versioning rules was not found in any deployment", buildId);
+            }
+        }
+        return ordered;
+    }
+
+    private List<ListWorkerDeploymentsResponse.WorkerDeploymentSummary> fetchAllWorkerDeployments(
+            WorkflowServiceGrpc.WorkflowServiceBlockingStub stub,
+            String namespace) {
+
+        List<ListWorkerDeploymentsResponse.WorkerDeploymentSummary> summaries = new ArrayList<>();
+        ByteString nextPageToken = ByteString.EMPTY;
+
+        do {
+            ListWorkerDeploymentsRequest.Builder requestBuilder = ListWorkerDeploymentsRequest.newBuilder()
+                    .setNamespace(namespace);
+            if (!nextPageToken.isEmpty()) {
+                requestBuilder.setNextPageToken(nextPageToken);
+            }
+
+            ListWorkerDeploymentsResponse response = stub.listWorkerDeployments(requestBuilder.build());
+            summaries.addAll(response.getWorkerDeploymentsList());
+            nextPageToken = response.getNextPageToken();
+            if (nextPageToken == null) {
+                nextPageToken = ByteString.EMPTY;
+            }
+        } while (!nextPageToken.isEmpty());
+
+        return summaries;
+    }
+
+    private void addVersionSummary(WorkerDeploymentInfo.WorkerDeploymentVersionSummary summary,
+            Map<String, WorkerDeploymentVersion> accumulator) {
+        if (summary == null || !summary.hasDeploymentVersion()) {
+            return;
+        }
+        WorkerDeploymentVersion version = summary.getDeploymentVersion();
+        if (version.getBuildId().isBlank() || version.getDeploymentName().isBlank()) {
+            return;
+        }
+        accumulator.putIfAbsent(version.getBuildId(), version);
+    }
+
+    private long calculateBacklogFromVersionQueue(
+            DescribeWorkerDeploymentVersionResponse.VersionTaskQueue taskQueue) {
+        long backlog = 0;
+        if (taskQueue.hasStats()) {
+            backlog = Math.max(taskQueue.getStats().getApproximateBacklogCount(), 0);
+        }
+
+        if (backlog <= 0 && taskQueue.getStatsByPriorityKeyCount() > 0) {
+            backlog = taskQueue.getStatsByPriorityKeyMap().values().stream()
+                    .mapToLong(TaskQueueStats::getApproximateBacklogCount)
+                    .sum();
+        }
+
+        return Math.max(backlog, 0);
+    }
+
+    /**
+     * Calculate backlog size from DescribeTaskQueueResponse by inspecting both
+     * legacy {@link TaskQueueStatus} hints and the newer stats payload when
+     * available.
+     */
+    private long calculateBacklogSize(DescribeTaskQueueResponse response) {
+        long totalBacklog = 0;
+
+        if (response.hasTaskQueueStatus()) {
+            TaskQueueStatus legacyStatus = response.getTaskQueueStatus();
+            totalBacklog = legacyStatus.getBacklogCountHint();
+            log.debug("TaskQueueStatus backlog hint: {}", totalBacklog);
+        }
+
+        // In Temporal SDK 1.32+ -- stats are here
+        var stats = response.hasStats() ? response.getStats() : null;
+
+        if (stats != null) {
+            long approximate = stats.getApproximateBacklogCount();
+            double addRate = stats.getTasksAddRate();
+            double dispatchRate = stats.getTasksDispatchRate();
+
+            if (approximate > totalBacklog) {
+                totalBacklog = approximate;
+            }
+
+            log.debug("Approx backlog: {}", approximate);
+            log.debug("Task add rate (/s): {}", addRate);
+            log.debug("Task dispatch rate (/s): {}", dispatchRate);
+        }
+
+        if (totalBacklog < 0) {
+            totalBacklog = 0;
+        }
+
         return totalBacklog;
     }
 
@@ -305,9 +549,6 @@ public class TemporalClientFacade {
         private String tlsServerName;
         private boolean unsafeSsl;
         private Duration minConnectTimeout;
-        private String buildId;
-        private Boolean selectAllActive;
-        private Boolean selectUnversioned;
 
         // Getters and setters
         public String getEndpoint() {
@@ -404,30 +645,6 @@ public class TemporalClientFacade {
 
         public void setMinConnectTimeout(Duration minConnectTimeout) {
             this.minConnectTimeout = minConnectTimeout;
-        }
-
-        public String getBuildId() {
-            return buildId;
-        }
-
-        public void setBuildId(String buildId) {
-            this.buildId = buildId;
-        }
-
-        public Boolean getSelectAllActive() {
-            return selectAllActive;
-        }
-
-        public void setSelectAllActive(Boolean selectAllActive) {
-            this.selectAllActive = selectAllActive;
-        }
-
-        public Boolean getSelectUnversioned() {
-            return selectUnversioned;
-        }
-
-        public void setSelectUnversioned(Boolean selectUnversioned) {
-            this.selectUnversioned = selectUnversioned;
         }
 
         public boolean hasMtlsConfig() {

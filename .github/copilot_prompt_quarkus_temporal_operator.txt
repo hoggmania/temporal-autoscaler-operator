@@ -8,7 +8,7 @@ Create a production-ready Java Quarkus-based Kubernetes Operator that:
 - Queries a Temporal frontend (gRPC) to read Task Queue sizes (Workflow or Activity queues) and decides scaling actions.
 - Scales the target Kubernetes workload (Deployment / StatefulSet / ReplicaSet) up and down by patching the `spec.replicas` value on the target resource.
 - Supports multiple triggers and several taskQueue instances that may need independent scaling.
-- Includes authentication options (apiKey via Secret or mTLS certs), connect-timeout, and version selectors (buildId, selectAllActive, selectUnversioned).
+- Includes authentication options (apiKey via Secret or mTLS certs), connect-timeout, and automatic Worker Deployment / Versioning Rule awareness.
 - Exposes metrics (Prometheus) and health/readiness endpoints, and includes unit/integration tests.
 
 Constraints & non-functional requirements
@@ -45,9 +45,6 @@ Provide CRD with fields matching the user's `triggers` example. Example `Tempora
 - queueTypes
 - targetQueueSize
 - activationTargetQueueSize
-- buildId
-- selectAllActive
-- selectUnversioned
 - minConnectTimeout
 - unsafeSsl
 - tlsServerName
@@ -89,11 +86,11 @@ Behavior & controller logic (detailed)
 --------------------------------------
 1. Reconcile loop receives a TemporalScaler CR (the custom resource). For each `trigger` of type `temporal`, create an internal watch job.
 2. For each trigger instance poll the Temporal frontend every `pollingInterval` seconds (configurable on CR). Query the task queue length for the specific `taskQueue` and `queueTypes`:
-   - Use Temporal gRPC query: listTaskQueuePartitions / getTaskQueueUserLevelStats (note: implement using the Temporal Java SDK; if API differs, create an adapter `TemporalClientFacade` that calls the appropriate RPC). Handle `buildId`, `selectAllActive`, `selectUnversioned` as filters.
+   - Prefer Temporal's Worker Versioning APIs (Worker Deployments + Versioning Rules) to read per-build backlog and fall back to legacy DescribeTaskQueue (enhanced mode) if those endpoints are unavailable.
 3. Determine desired replicas:
    - If `queueLength` &gt; `targetQueueSize` * currentReplicas -> desiredReplicas = ceil(queueLength / targetQueueSize)
    - Enforce `minReplicaCount` and `maxReplicaCount`.
-   - Activation: if currentReplicas == 0 and `queueLength` &gt;= `activationTargetQueueSize` then allow scale-up. If `selectAllActive` or `selectUnversioned` change selection behavior, use them as filters when reading queue size.
+   - Activation: if currentReplicas == 0 and `queueLength` &gt;= `activationTargetQueueSize` then allow scale-up.
 4. Acquire a Lease for that target (name pattern: `temporal-scaler-<namespace>-<targetName>-<taskQueue>`). Use Lease to ensure only one operator instance performs the patch.
    - Lease TTL should be longer than the reconcile / poll interval but short enough to allow failover (configurable).
    - On successful acquire: patch target workload `spec.replicas` using a JSON Merge Patch or Strategic Merge Patch.

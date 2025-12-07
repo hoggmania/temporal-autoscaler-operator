@@ -131,15 +131,6 @@ spec:
                             type: string
                             description: Minimum queue size to activate scaling from zero
                             default: "0"
-                          buildId:
-                            type: string
-                            description: Temporal build ID filter
-                          selectAllActive:
-                            type: string
-                            description: Select all active workers (true/false)
-                          selectUnversioned:
-                            type: string
-                            description: Select unversioned workers (true/false)
                           minConnectTimeout:
                             type: string
                             description: Minimum connection timeout for Temporal client

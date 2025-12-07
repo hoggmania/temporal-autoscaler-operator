@@ -87,6 +87,12 @@ oc get events -n default --sort-by='.lastTimestamp'
 
 ## Configuration Options
 
+### Temporal Worker Versioning Backlog
+
+- No CRD fields or Helm values are required for build IDs; the operator queries Temporal's Worker Deployment + Versioning Rules APIs to discover the active deployments for each task queue.
+- Backlog is aggregated from `DescribeWorkerDeploymentVersion` responses. If the namespace does not expose Worker Versioning yet, the operator automatically falls back to `DescribeTaskQueue` with enhanced stats so scaling continues to function.
+- Ensure the service account you use to connect to Temporal can call `GetWorkerVersioningRules`, `ListWorkerDeployments`, and `DescribeWorkerDeploymentVersion` when your cluster has Worker Versioning enabled.
+
 ### Enable OpenShift Route
 
 ```bash

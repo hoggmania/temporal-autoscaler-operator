@@ -67,6 +67,12 @@ helm install temporal-autoscaler ./temporal-autoscaler-operator \
 - Namespace-scoped or cluster-wide operation
 - Custom security contexts and RBAC
 
+### Temporal Backlog Source
+
+- Automatically uses Temporal's Worker Deployment + Versioning Rules APIs to resolve build IDs and backlog
+- Aggregates queue stats per deployment version and only falls back to `DescribeTaskQueue` when the namespace lacks Worker Versioning support
+- No Helm values or CRD fields are required for build IDs; the operator discovers them dynamically at runtime
+
 ## Configuration Examples
 
 ### With Monitoring

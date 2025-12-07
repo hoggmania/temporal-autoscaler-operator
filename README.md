@@ -7,6 +7,7 @@ A Kubernetes Operator built with Quarkus and Java Operator SDK that provides aut
 The Temporal Autoscaler Operator monitors Temporal task queues and automatically scales Kubernetes workloads (Deployments, StatefulSets, ReplicaSets) based on queue backlog. It provides:
 
 - **Temporal-driven scaling**: Scale based on workflow or activity queue sizes
+- **Worker versioning aware backlog**: Prefer the Worker Deployment + Versioning Rules APIs and only fall back to legacy DescribeTaskQueue when a namespace lacks those RPCs
 - **Custom metrics support**: Scale based on workflow execution rates, latencies, success rates, and custom metrics
 - **Distributed coordination**: Uses Kubernetes Leases API to prevent concurrent scaling operations
 - **Multiple trigger support**: Monitor multiple task queues with different scaling policies
@@ -138,6 +139,17 @@ spec:
                   │  - fulfill-q    │
                   └─────────────────┘
 ```
+
+### How Backlog Is Calculated
+
+The operator no longer relies on user-provided build IDs or version sets. Instead it uses the Worker Versioning surface to discover what needs to be drained:
+
+1. **Get worker versioning rules**: Fetch assignment and compatible redirect rules for the task queue to collect the authoritative build IDs.
+2. **Resolve deployments/versions**: Use `ListWorkerDeployments` and, if necessary, `DescribeWorkerDeployment` to map each build ID to a concrete deployment version.
+3. **Pull backlog per version**: Call `DescribeWorkerDeploymentVersion` with `reportTaskQueueStats` enabled and sum the backlog for the requested queue/type combination.
+4. **Graceful fallback**: When a namespace doesn’t expose those APIs (older clusters or permissions), the operator automatically falls back to `DescribeTaskQueue` in enhanced mode so queue-based scaling keeps working.
+
+This flow mirrors what Temporal Cloud uses internally, so no CRD field is required for build IDs and discrepancies between worker rollouts and autoscaling signals are eliminated.
 
 ## Features
 
@@ -383,10 +395,9 @@ spec:
         # key: "base64-encoded-client-key"
         # tlsServerName: "temporal.example.com"
         
-        # Optional: Versioning
-        # buildId: "v1.2.3"
-        # selectAllActive: "true"
-        # selectUnversioned: "false"
+        # Worker versioning is resolved automatically.
+        # The operator inspects Worker Deployments + Versioning Rules for this queue
+        # and falls back to legacy DescribeTaskQueue if those APIs are unavailable.
       
       # Optional: Custom metrics scaling (overrides queue-based scaling)
       customMetrics:
@@ -613,13 +624,13 @@ The custom metrics feature is currently implemented with stub methods. To enable
 
 ### Temporal API Compatibility
 
-The `TemporalClientFacade` includes a placeholder implementation for queue size calculation. The actual backlog calculation depends on your Temporal version and available APIs.
+The `TemporalClientFacade` now prefers Temporal's Worker Versioning APIs (Worker Deployments + Versioning Rules) to measure backlog per build/deployment. If those RPCs are unavailable, it falls back to `DescribeTaskQueue` with enhanced stats. Validate which path your cluster supports and adjust credentials/permissions accordingly.
 
 **TODO for production use:**
 
 1. Verify the Temporal gRPC API methods for your version
 2. Implement proper queue size calculation in `calculateBacklogSize()`
-3. Handle `buildId`, `selectAllActive`, and `selectUnversioned` filters
+3. Validate Worker Deployment + Versioning Rule queries against your cluster (the operator now prefers these APIs and falls back to `DescribeTaskQueue` if they are unavailable)
 4. Test with your specific Temporal deployment
 
 ### Scaling to Zero Considerations

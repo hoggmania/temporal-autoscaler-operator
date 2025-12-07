@@ -30,7 +30,6 @@ public class LeaseCoordinator {
 
     private static final Logger log = LoggerFactory.getLogger(LeaseCoordinator.class);
 
-    private static final int DEFAULT_LEASE_DURATION_SECONDS = 15;
     private static final String LEASE_LABEL_KEY = "app.kubernetes.io/component";
     private static final String LEASE_LABEL_VALUE = "temporal-autoscaler";
 

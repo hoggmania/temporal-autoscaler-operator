@@ -8,8 +8,6 @@ import io.fabric8.kubernetes.api.model.apps.ReplicaSet;
 import io.fabric8.kubernetes.api.model.apps.StatefulSet;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.javaoperatorsdk.operator.api.reconciler.ControllerConfiguration;
-import io.javaoperatorsdk.operator.api.reconciler.ErrorStatusHandler;
-import io.javaoperatorsdk.operator.api.reconciler.ErrorStatusUpdateControl;
 import io.javaoperatorsdk.operator.api.reconciler.Reconciler;
 import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
 import io.javaoperatorsdk.operator.api.reconciler.Context;
@@ -46,7 +44,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * - Supports both queue-based and custom metric-based scaling
  */
 @ControllerConfiguration
-public class TemporalScalerController implements Reconciler<TemporalScaler>, ErrorStatusHandler<TemporalScaler> {
+public class TemporalScalerController implements Reconciler<TemporalScaler> {
 
     private static final Logger log = LoggerFactory.getLogger(TemporalScalerController.class);
 
@@ -75,6 +73,8 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
         String resourceKey = getResourceKey(resource);
         log.info("Reconciling TemporalScaler: {}", resourceKey);
 
+        Duration rescheduleAfter = resolvePollingInterval(resource);
+
         try {
             TemporalScalerSpec spec = resource.getSpec();
             TemporalScalerStatus status = resource.getStatus() != null 
@@ -83,9 +83,9 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
 
             // Validate spec
             if (!validateSpec(spec)) {
-                updateCondition(status, "Invalid", "True", "ValidationFailed", 
-                    "Invalid specification: check scaleTargetRef and triggers");
-                return UpdateControl.patchStatus(resource);
+                updateCondition(status, "Invalid", "True", "ValidationFailed",
+                        "Invalid specification: check scaleTargetRef and triggers");
+                return patchStatusWithReschedule(resource, rescheduleAfter);
             }
 
             // Get current replicas from target workload
@@ -93,7 +93,7 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
             if (currentReplicas == null) {
                 updateCondition(status, "Ready", "False", "TargetNotFound", 
                     "Target workload not found");
-                return UpdateControl.patchStatus(resource);
+                return patchStatusWithReschedule(resource, rescheduleAfter);
             }
 
             status.setCurrentReplicas(currentReplicas);
@@ -102,7 +102,7 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
             if (isInCooldown(resourceKey, spec.getCooldownPeriod())) {
                 log.debug("Resource {} is in cooldown period, skipping scaling", resourceKey);
                 updateCondition(status, "Ready", "True", "InCooldown", "In cooldown period");
-                return UpdateControl.patchStatus(resource);
+                return patchStatusWithReschedule(resource, rescheduleAfter);
             }
 
             // Calculate desired replicas from all triggers
@@ -135,7 +135,7 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
 
             status.setObservedGeneration(resource.getMetadata().getGeneration());
             
-            return UpdateControl.patchStatus(resource);
+            return patchStatusWithReschedule(resource, rescheduleAfter);
 
         } catch (Exception e) {
             log.error("Error reconciling TemporalScaler {}: {}", resourceKey, e.getMessage(), e);
@@ -146,7 +146,7 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
             updateCondition(status, "Ready", "False", "ReconciliationError", 
                 "Error: " + e.getMessage());
             
-            return UpdateControl.patchStatus(resource);
+            return patchStatusWithReschedule(resource, rescheduleAfter);
         }
     }
 
@@ -570,11 +570,6 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
             }
         }
 
-        // Versioning options
-        config.setBuildId(trigger.getMetadataValue("buildId"));
-        config.setSelectAllActive(Boolean.parseBoolean(trigger.getMetadataValue("selectAllActive", "false")));
-        config.setSelectUnversioned(Boolean.parseBoolean(trigger.getMetadataValue("selectUnversioned", "false")));
-
         return config;
     }
 
@@ -644,17 +639,17 @@ public class TemporalScalerController implements Reconciler<TemporalScaler>, Err
         );
     }
 
-    @Override
-    public ErrorStatusUpdateControl<TemporalScaler> updateErrorStatus(TemporalScaler resource, 
-                                                                      Context<TemporalScaler> context, 
-                                                                      Exception e) {
-        TemporalScalerStatus status = resource.getStatus() != null 
-            ? resource.getStatus() 
-            : new TemporalScalerStatus();
-        
-        updateCondition(status, "Ready", "False", "Error", 
-            "Reconciliation error: " + e.getMessage());
-        
-        return ErrorStatusUpdateControl.patchStatus(resource);
+    private UpdateControl<TemporalScaler> patchStatusWithReschedule(TemporalScaler resource, Duration delay) {
+        return UpdateControl.patchStatus(resource).rescheduleAfter(delay);
     }
+
+    private Duration resolvePollingInterval(TemporalScaler resource) {
+        TemporalScalerSpec spec = resource.getSpec();
+        int intervalSeconds = 5;
+        if (spec != null && spec.getPollingInterval() != null && spec.getPollingInterval() > 0) {
+            intervalSeconds = spec.getPollingInterval();
+        }
+        return Duration.ofSeconds(intervalSeconds);
+    }
+
 }
