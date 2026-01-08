@@ -31,7 +31,7 @@
 
         <josdk.version>5.2.1</josdk.version>
         <slf4j.version>2.0.17</slf4j.version>
-        <log4j.version>2.20.0</log4j.version>
+        <log4j.version>2.25.3</log4j.version>
         <fabric8-client.version>7.4.0</fabric8-client.version>
 
         <!-- Native build properties -->
